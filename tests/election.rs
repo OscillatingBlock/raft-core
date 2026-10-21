@@ -1,11 +1,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use bytes::Bytes;
+use mini_raft::state_machine::StateMachine;
 use mini_raft::{
     codec::Message,
     config::ServerConfig,
     server::{NodeId, Server},
-    state_machine::SimpleStateMachine,
 };
+use std::sync::RwLock;
 use tokio::sync::mpsc;
 
 fn test_config(node_id: u64, election_timeout_ms: u64) -> ServerConfig {
@@ -33,7 +35,7 @@ async fn single_node_times_out_and_requests_votes() {
     let mut server = Server::new(
         NodeId::new(0),
         test_config(0, 150),
-        Arc::new(SimpleStateMachine::new()),
+        Arc::new(SimpleStateMachine::default()),
         to_network_tx,
         from_network_rx,
     );
@@ -55,4 +57,16 @@ async fn single_node_times_out_and_requests_votes() {
     }
 
     handle.abort();
+}
+
+#[derive(Default)]
+pub struct SimpleStateMachine {
+    data_store: RwLock<Vec<Bytes>>,
+}
+
+impl StateMachine for SimpleStateMachine {
+    fn apply_log(&self, command: &Bytes) -> anyhow::Result<Bytes> {
+        self.data_store.write().unwrap().push(command.clone());
+        Ok(command.clone())
+    }
 }

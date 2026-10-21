@@ -1,9 +1,9 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use mini_raft::codec::{
-    AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Codec, Hello,
-    HelloClient, Message, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Codec, Hello, HelloClient,
+    Message, RequestVote, RequestVoteResponse,
 };
-use mini_raft::server::{LogCommand, LogEntry, NodeId};
+use mini_raft::server::{LogEntry, NodeId};
 use tokio_util::codec::{Decoder, Encoder};
 
 fn roundtrip(msg: Message) -> Message {
@@ -46,10 +46,7 @@ fn codec_roundtrips_all_variants() {
             prev_log_term: 1,
             entries: vec![LogEntry {
                 term: 3,
-                command: LogCommand::Set {
-                    key: "k".into(),
-                    value: "v".into(),
-                },
+                command: Bytes::from("cmd"),
                 index: 1,
                 client_id: 7,
                 request_id: 9,
@@ -71,14 +68,11 @@ fn codec_roundtrips_all_variants() {
             vote_granted: true,
         }),
         Message::ClientRequestType(ClientRequest {
-            command: LogCommand::Set {
-                key: "foo".into(),
-                value: "bar".into(),
-            },
+            command: Bytes::from("cmd1"),
             client_id: 42,
             request_id: 1,
         }),
-        Message::ClientResponseType(ClientResponse::SetSuccess { request_id: 1 }),
+        Message::ClientResponseType(ClientResponse::Success { request_id: 1 }),
         Message::HelloType(Hello { id: NodeId::new(1) }),
         Message::HelloClientType(HelloClient {
             id: mini_raft::server::ClientId::new(99),

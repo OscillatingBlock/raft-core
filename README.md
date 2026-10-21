@@ -1,17 +1,17 @@
-# mini_raft
+# raft_core
 
-Learning project: Raft consensus in Rust, built after reading the Raft paper.
+*(Previously `mini_raft`)*: Learning project: Raft consensus in Rust, built after reading the Raft paper, recently rebranded and refactored into `raft_core`.
 
 ## Layout
 
-- `src/server.rs` — Raft core (follower/candidate/leader, log replication)
-- `src/network.rs` — TCP peers/clients, handshake, dispatch
-- `src/codec.rs` — length-prefixed JSON framing
-- `src/state_machine.rs` — simple key-value store
-- `src/config.rs` / `src/main.rs` — per-node config and binary
-- `tests/` — integration tests
-- `tools/raft_client.py` — minimal client for manual testing
-- `config-node1..5.toml` — 5-node local cluster configs
+* `src/server.rs` — Raft core (follower/candidate/leader, log replication)
+* `src/network.rs` — TCP peers/clients, handshake, dispatch
+* `src/codec.rs` — length-prefixed JSON framing
+* `src/state_machine.rs` — simple key-value store
+* `src/config.rs` / `src/main.rs` — per-node config and binary
+* `tests/` — integration tests
+* `tools/raft_client.py` — minimal client for manual testing
+* `config-node1..5.toml` — 5-node local cluster configs
 
 ## Architecture
 
@@ -27,15 +27,19 @@ advance `commit_index` on majority ack, then apply entries to the key-value
 
 ```sh
 cargo build
-./target/debug/mini_raft --config config-node1.toml
+./target/debug/raft_core --config config-node1.toml
 # ... start nodes 1-5 (ports 9001-9005 / 8081-8085)
 python3 tools/raft_client.py --nodes 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083,127.0.0.1:8084,127.0.0.1:8085 --key foo --value bar
+
 ```
 
 ## Test
 
 ```sh
 cargo test
+
 ```
+
+---
 
 Unit tests for the node logic were written by the author. Integration testing (`tests/codec.rs`, `tests/election.rs`, `tests/cluster.rs`, `tests/tcp.rs`) was done by Muse Spark.

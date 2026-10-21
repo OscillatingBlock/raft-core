@@ -1,4 +1,4 @@
-use crate::server::{ClientId, LogCommand, LogEntry, NodeId};
+use crate::server::{ClientId, LogEntry, NodeId};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io;
@@ -63,7 +63,7 @@ pub struct RequestVoteResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRequest {
-    pub command: LogCommand,
+    pub command: bytes::Bytes,
     pub client_id: u32,
     pub request_id: u32,
 }
@@ -81,30 +81,8 @@ pub struct HelloClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientResponse {
     // Success responses for each operation
-    GetSuccess {
-        request_id: u64,
-        value: Option<String>, // Returns the value if found
-    },
-    SetSuccess {
-        request_id: u64,
-    },
-    DeleteSuccess {
-        request_id: u64,
-        existed: bool, // True if the key was present and deleted, false otherwise
-    },
-
-    // Failure and error responses
-    KeyNotFound {
-        request_id: u64,
-    },
-    NotLeader {
-        request_id: u64,
-        leader_hint: Option<NodeId>, // Helps the client retry with the correct node
-    },
-    InternalError {
-        request_id: u64,
-        reason: String,
-    },
+    Success { request_id: u64 },
+    InternalError { request_id: u64, reason: String },
 }
 
 #[derive(Clone)]

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-bytes = "1.12.1"
+bytes = { version = "1.12.1", features = ["serde"] }
 config = "0.15.25"
 dotenvy = "0.15.7"
 futures = "0.3.34"

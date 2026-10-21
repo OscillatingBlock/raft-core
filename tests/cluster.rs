@@ -1,17 +1,53 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc, time::Duration};
-
-use mini_raft::{
-    codec::{ClientRequest, Message},
-    config::ServerConfig,
-    server::{Destination, Id, Incoming, LogCommand, NodeId, Outgoing, Server},
-    state_machine::{SimpleStateMachine, StateMachine},
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
 };
+
+use bytes::Bytes;
+use mini_raft::{
+    codec::{ClientRequest, ClientResponse, Message},
+    config::ServerConfig,
+    server::{Destination, Id, Incoming, NodeId, Outgoing, Server},
+    state_machine::StateMachine,
+};
+use std::sync::RwLock;
 use tokio::sync::mpsc;
+
+/// Simple state machine for testing that interprets bytes as "key=value" pairs.
+struct TestStateMachine {
+    store: RwLock<HashMap<String, String>>,
+}
+
+impl TestStateMachine {
+    fn new() -> Self {
+        Self {
+            store: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_value(&self, key: String) -> Option<String> {
+        self.store.read().unwrap().get(&key).cloned()
+    }
+}
+
+impl StateMachine for TestStateMachine {
+    fn apply_log(&self, command: &Bytes) -> anyhow::Result<Bytes> {
+        let cmd_str = String::from_utf8_lossy(command);
+        if let Some((k, v)) = cmd_str.split_once('=') {
+            self.store
+                .write()
+                .unwrap()
+                .insert(k.to_string(), v.to_string());
+        }
+        Ok(Bytes::new())
+    }
+}
 
 struct NodeHandles {
     id: NodeId,
     to_server: mpsc::Sender<Incoming>,
-    state_machine: Arc<SimpleStateMachine>,
+    state_machine: Arc<TestStateMachine>,
 }
 
 fn node_config(node_id: u64, election_timeout_ms: u64) -> ServerConfig {
@@ -41,7 +77,6 @@ async fn router(
 ) {
     let id_of = |nid: NodeId| nid;
     loop {
-        // Poll each receiver in order; simple and fair enough for 3 nodes.
         let mut progressed = false;
         for (sender_id, rx) in from_servers.iter_mut() {
             match rx.try_recv() {
@@ -74,9 +109,6 @@ async fn router(
                             }
                         }
                         Destination::Client(cid) => {
-                            // ClientId is opaque; recover inner via JSON roundtrip is
-                            // overkill — forward raw message, test matches on content.
-                            // Use debug parse of request_id from message instead.
                             let _ = client_tx.send((0, out.msg)).await;
                             let _ = cid;
                         }
@@ -97,7 +129,6 @@ async fn spawn_cluster() -> (
     mpsc::Receiver<(u32, Message)>,
     mpsc::UnboundedReceiver<(NodeId, Message)>,
 ) {
-    // Staggered timeouts -> deterministic leader (node 0 fastest).
     let timeouts = [150u64, 300, 450];
     let mut to_servers = HashMap::new();
     let mut from_servers = Vec::new();
@@ -109,7 +140,7 @@ async fn spawn_cluster() -> (
         let id = NodeId::new(i);
         let (to_net_tx, from_srv_rx) = mpsc::channel::<Outgoing>(64);
         let (to_srv_tx, from_net_rx) = mpsc::channel::<Incoming>(64);
-        let sm = Arc::new(SimpleStateMachine::new());
+        let sm = Arc::new(TestStateMachine::new());
         let server = Server::new(
             id,
             node_config(i, timeouts[i as usize]),
@@ -135,32 +166,20 @@ async fn spawn_cluster() -> (
     (handles, client_rx, observe_rx)
 }
 
-async fn elect_leader(
-    observe_rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>,
-) -> NodeId {
-    // Collect heartbeat senders (empty AppendEntries) for ~1.5s.
-    // Exactly one node should be sending them.
+async fn elect_leader(observe_rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>) -> NodeId {
     let mut senders = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < deadline {
-        let remaining =
-            deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, observe_rx.recv()).await {
             Ok(Some((from, Message::AppendEntriesType(ae)))) if ae.entries.is_empty() => {
                 senders.insert(from);
-                // Once we've seen heartbeats, give followers time to potentially
-                // (incorrectly) also send heartbeats, then decide.
                 if senders.len() > 1 {
                     break;
                 }
-                // Require at least 3 heartbeats from same leader for stability.
-                // Continue observing briefly.
                 if senders.len() == 1 {
                     tokio::time::sleep(Duration::from_millis(600)).await;
-                    // Drain any additional heartbeat senders observed during sleep.
-                    while let Ok((f2, Message::AppendEntriesType(ae2))) =
-                        observe_rx.try_recv()
-                    {
+                    while let Ok((f2, Message::AppendEntriesType(ae2))) = observe_rx.try_recv() {
                         if ae2.entries.is_empty() {
                             senders.insert(f2);
                         }
@@ -186,7 +205,6 @@ async fn elect_leader(
 async fn three_nodes_elect_single_leader() {
     let (_nodes, _client_rx, mut observe_rx) = spawn_cluster().await;
     let leader = elect_leader(&mut observe_rx).await;
-    // Leader must be one of the three nodes.
     assert!(leader == NodeId::new(0) || leader == NodeId::new(1) || leader == NodeId::new(2));
 }
 
@@ -201,10 +219,7 @@ async fn leader_replicates_client_set_to_all_nodes() {
         .send(Incoming {
             from: Id::Peer(NodeId::new(99)),
             msg: Message::ClientRequestType(ClientRequest {
-                command: LogCommand::Set {
-                    key: "foo".to_string(),
-                    value: "bar".to_string(),
-                },
+                command: Bytes::from("foo=bar"),
                 client_id: 42,
                 request_id: 7,
             }),
@@ -212,23 +227,19 @@ async fn leader_replicates_client_set_to_all_nodes() {
         .await
         .unwrap();
 
-    // Leader must eventually respond SetSuccess (majority replication).
     let mut got_success = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < deadline {
-        let remaining =
-            deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, client_rx.recv()).await {
-            Ok(Some((_cid, Message::ClientResponseType(resp)))) => {
-                match resp {
-                    mini_raft::codec::ClientResponse::SetSuccess { request_id } => {
-                        assert_eq!(request_id, 7);
-                        got_success = true;
-                        break;
-                    }
-                    other => panic!("unexpected client response: {:?}", other),
+            Ok(Some((_cid, Message::ClientResponseType(resp)))) => match resp {
+                ClientResponse::Success { request_id } => {
+                    assert_eq!(request_id, 7);
+                    got_success = true;
+                    break;
                 }
-            }
+                other => panic!("unexpected client response: {:?}", other),
+            },
             Ok(Some((_cid, other))) => {
                 panic!("expected ClientResponse, got {}", other.message_type())
             }
@@ -236,9 +247,8 @@ async fn leader_replicates_client_set_to_all_nodes() {
             Err(_) => break,
         }
     }
-    assert!(got_success, "leader did not commit client Set");
+    assert!(got_success, "leader did not commit client command");
 
-    // All three state machines must converge to foo=bar (via forwarded commits).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
         let all_ok = nodes
