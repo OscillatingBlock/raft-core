@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 impl Server {
     /// Starts the complete Raft node, including network listeners,
     /// background message dispatchers, and the core consensus loop.
-    pub async fn start<SM>(config: ServerConfig, state_machine: SM) -> anyhow::Result<()>
+    pub async fn start<SM>(config: ServerConfig, state_machine: Arc<SM>) -> anyhow::Result<()>
     where
         SM: StateMachine + 'static,
     {
@@ -33,7 +33,7 @@ impl Server {
         let mut server = Server::new(
             node_id,
             config,
-            Arc::new(state_machine),
+            state_machine.clone(),
             to_network,
             from_network,
         );

@@ -23,7 +23,7 @@ impl ServerConfig {
     pub fn load() -> anyhow::Result<Self> {
         // Precedence: MINI_RAFT_CONFIG env var, else "config" (backwards compat).
         // CLI --config handling lives in main.rs, which calls load_from directly.
-        let path = std::env::var("MINI_RAFT_CONFIG").unwrap_or_else(|_| "config".to_string());
+        let path = std::env::var("LOCKIN").unwrap_or_else(|_| "config".to_string());
         Self::load_from(&path)
     }
 
@@ -33,9 +33,13 @@ impl ServerConfig {
         let config = config::Config::builder()
             .set_default("election_timeout", 500)?
             .set_default("heartbeat_interval", 200)?
-            .add_source(File::with_name(stem).format(config::FileFormat::Toml).required(true))
             .add_source(
-                Environment::with_prefix("MINI_RAFT")
+                File::with_name(stem)
+                    .format(config::FileFormat::Toml)
+                    .required(true),
+            )
+            .add_source(
+                Environment::with_prefix("LOCKIN")
                     .separator("_")
                     .try_parsing(true),
             )

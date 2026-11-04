@@ -3,7 +3,7 @@ use bytes::Bytes;
 use mini_raft::config::ServerConfig;
 use mini_raft::server::Server;
 use mini_raft::state_machine::StateMachine;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, info, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     info!(target: "main", %config_path, "resolved config file path");
     let config = ServerConfig::load_from(&config_path).context("failed to load config")?;
 
-    Server::start(config, SimpleStateMachine::default()).await?;
+    Server::start(config, Arc::new(SimpleStateMachine::default())).await?;
     Ok(())
 }
 
