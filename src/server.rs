@@ -1,27 +1,20 @@
 use crate::{
     codec::{
-        AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Message, RequestVote,
-        RequestVoteResponse,
+        AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
     },
     config::ServerConfig,
 };
-use anyhow::{Context, Ok};
+use anyhow::Context;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::mpsc::{self},
+    sync::{mpsc::{self}, oneshot},
     time::Instant,
 };
 use tracing::{debug, field::debug, info, instrument, warn};
 
 use crate::state_machine::StateMachine;
-
-#[derive(Clone, Debug, Copy)]
-pub enum Id {
-    Client(ClientId),
-    Peer(NodeId),
-}
 
 #[allow(dead_code)]
 pub struct Server {
@@ -30,7 +23,16 @@ pub struct Server {
     config: ServerConfig,
     to_network: mpsc::Sender<Outgoing>,
     from_network: tokio::sync::Mutex<mpsc::Receiver<Incoming>>,
+
     log: Vec<LogEntry>,
+
+    /// Queue drained by the consensus loop: proposals submitted via `propose`.
+    proposal_queue: mpsc::Receiver<Proposal>,
+    /// Submission end of the proposal queue (handed out by `propose`/`raft_node`).
+    proposals: mpsc::Sender<Proposal>,
+    /// One `ack` per un-applied leader proposal; completed when the command
+    /// commits and is applied to the state machine.
+    commit_notifiers: HashMap<i32, oneshot::Sender<anyhow::Result<()>>>,
 }
 
 #[allow(dead_code)]
@@ -110,25 +112,12 @@ pub struct LogEntry {
     pub term: u32,
     pub command: Bytes,
     pub index: u32,
-    pub client_id: u32,
-    pub request_id: u32,
 }
 
 #[allow(dead_code)]
 pub enum Destination {
-    Client(ClientId),
     Node(NodeId),
     Broadcast,
-}
-
-#[allow(dead_code)]
-#[derive(Eq, Hash, PartialEq, Debug, Clone, Serialize, Deserialize, Copy)]
-pub struct ClientId(u32);
-
-impl ClientId {
-    pub fn new(id: u32) -> Self {
-        Self(id)
-    }
 }
 
 #[allow(dead_code)]
@@ -140,8 +129,73 @@ pub struct Outgoing {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Incoming {
-    pub from: Id,
+    pub from: NodeId,
     pub msg: Message,
+}
+
+/// A user-submitted command awaiting replication through the Raft protocol.
+/// `ack` resolves once the command has been committed by a majority and applied
+/// to the state machine, or carries an error if the proposal is rejected
+/// (e.g. the node is not, or is no longer, the leader).
+#[derive(Debug)]
+pub struct Proposal {
+    pub command: Bytes,
+    pub ack: oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// User-facing handle to a running Raft node. Cloning shares the same node.
+#[derive(Clone, Debug)]
+pub struct RaftNode {
+    pub id: NodeId,
+    proposals: mpsc::Sender<Proposal>,
+}
+
+impl Server {
+    /// Returns a shareable handle that can be used to submit commands
+    /// via [`RaftNode::propose`] while the node runs in the background.
+    pub fn raft_node(&self) -> RaftNode {
+        RaftNode {
+            id: self.id,
+            proposals: self.proposals.clone(),
+        }
+    }
+
+    /// Submits `command` to the Raft protocol and resolves once it has been
+    /// committed by a majority and applied to the state machine.
+    ///
+    /// Errors if the node is shutting down, or if it loses / does not hold
+    /// leadership before the command commits (callers should route the
+    /// command to the current leader or retry).
+    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<()> {
+        enqueue_proposal(&self.proposals, command.into()).await
+    }
+}
+
+impl RaftNode {
+    /// Submits `command` to the Raft protocol and resolves once it has been
+    /// committed by a majority and applied to the state machine.
+    ///
+    /// Errors if the node is shutting down, or if it loses / does not hold
+    /// leadership before the command commits (callers should route the
+    /// command to the current leader or retry).
+    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<()> {
+        enqueue_proposal(&self.proposals, command.into()).await
+    }
+}
+
+async fn enqueue_proposal(proposals: &mpsc::Sender<Proposal>, command: Bytes) -> anyhow::Result<()> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    proposals
+        .send(Proposal {
+            command,
+            ack: ack_tx,
+        })
+        .await
+        .context("proposal queue closed: node is shutting down")?;
+
+    ack_rx
+        .await
+        .context("proposal aborted: node lost leadership before commit")?
 }
 
 #[allow(dead_code)]
@@ -155,6 +209,7 @@ impl Server {
     ) -> Server {
         info!("initializing new server node");
         let state = ServerState::new(state_machine, config.total_nodes as usize);
+        let (proposals, proposal_queue) = mpsc::channel(256);
         let from_network = tokio::sync::Mutex::new(from_network);
         Self {
             id,
@@ -163,6 +218,9 @@ impl Server {
             to_network,
             from_network,
             log: vec![],
+            proposal_queue,
+            proposals,
+            commit_notifiers: HashMap::new(),
         }
     }
 
@@ -181,9 +239,24 @@ impl Server {
         }
     }
 
+    /// Rejects every queued proposal. Called whenever this node takes on a
+    /// non-leader role so that `propose()` callers waiting for an ack get a
+    /// prompt error instead of waiting for a command that can no longer
+    /// originate here.
+    fn reject_pending_proposals(&mut self) {
+        while let Ok(proposal) = self.proposal_queue.try_recv() {
+            let _ = proposal.ack.send(Err(anyhow::anyhow!(
+                "proposal rejected: node {} was not the leader when the proposal was processed",
+                self.id
+            )));
+        }
+        debug!("drained and rejected queued proposals");
+    }
+
     #[instrument(skip(self), fields(node_id = %self.id))]
     async fn follower(&mut self) {
         info!("entering follower state");
+        self.reject_pending_proposals();
         _ = self
             .apply_latest_commited_logs(self.state.commit_index)
             .await;
@@ -212,6 +285,7 @@ impl Server {
             warn!("not a candidate, cant run candidate loop");
             return;
         };
+        self.reject_pending_proposals();
         self.become_candidate();
 
         info!(
@@ -284,6 +358,8 @@ impl Server {
         self.become_leader();
 
         loop {
+            // Pick up commands submitted via `propose()` while we hold leadership.
+            _ = self.process_pending_proposals().await;
             self.handle_commit_index().await;
 
             tokio::select! {
@@ -366,11 +442,9 @@ impl Server {
                 self.handle_request_vote_response_rpc(request_vote_response_msg)
                     .await;
             }
-
-            Message::ClientRequestType(client_request) => {
-                self.handle_client_request(client_request).await?;
+            Message::HelloType(_) => {
+                debug!("ignoring stray hello message in server loop");
             }
-            _ => {}
         }
         Ok(())
     }
@@ -386,9 +460,7 @@ impl Server {
             term: self.state.current_term,
             success: false,
         });
-        let Id::Peer(node_id) = incoming.from else {
-            return Ok(());
-        };
+        let node_id = incoming.from;
         let reply = Outgoing {
             dest: Destination::Node(node_id),
             msg: response,
@@ -577,6 +649,11 @@ impl Server {
                             "log conflict detected, truncating conflicting entries"
                         );
                         self.log.truncate(entry.index as usize);
+                        // Entries from this index on no longer exist locally;
+                        // drop their proposal acks so `propose()` callers fail
+                        // fast instead of waiting forever.
+                        self.commit_notifiers
+                            .retain(|index, _| *index < entry.index as i32);
                         new_entries.push(entry.clone());
                     }
                 }
@@ -713,61 +790,49 @@ impl Server {
             );
             self.state.state_machine.apply_log(&log.command)?;
             self.state.last_applied = next;
+
+            // The entry is now durable and applied: release any `propose()`
+            // caller waiting on this index.
+            if let Some(ack) = self.commit_notifiers.remove(&next) {
+                let _ = ack.send(Ok(()));
+            }
         }
 
         Ok(())
     }
 
-    #[instrument(skip(self, msg), fields(node_id = %self.id, client_id = msg.client_id, request_id = msg.request_id))]
-    async fn handle_client_request(&mut self, msg: ClientRequest) -> anyhow::Result<()> {
-        let RaftState::Leader {
-            match_index: _,
-            next_index: _,
-        } = &self.state.state
-        else {
-            debug!("ignoring client request: node is not the leader");
-            return Ok(());
-        };
-
-        info!("handling incoming client request");
-
-        // append command to state machine
-        self.handle_set_command(msg.command, msg.client_id, msg.request_id)
-            .await?;
-
-        Ok(())
-    }
-
-    #[instrument(skip(self), fields(node_id = %self.id, client_id = client_id, request_id = request_id))]
-    async fn handle_set_command(
-        &mut self,
-        command: Bytes,
-        client_id: u32,
-        request_id: u32,
-    ) -> anyhow::Result<()> {
+    /// Drains proposals submitted via `propose()` while leader: each command is
+    /// appended to the local log and replicated to followers via AppendEntries.
+    /// The command's ack is stored in `commit_notifiers` and fires (in
+    /// `apply_latest_commited_logs`) once the majority commits and it is applied.
+    #[instrument(skip(self), fields(node_id = %self.id, command = ?command))]
+    async fn append_proposed_command_to_log(&mut self, command: Bytes, ack: oneshot::Sender<anyhow::Result<()>>) -> anyhow::Result<()> {
         let RaftState::Leader {
             match_index: _,
             next_index,
         } = &mut self.state.state
         else {
-            warn!("not handling set command, current state not leader");
+            warn!("not appending proposed command, current state not leader");
+            let _ = ack.send(Err(anyhow::anyhow!(
+                "proposal rejected: node {} lost leadership before the proposal was processed",
+                self.id
+            )));
             return Ok(());
         };
 
         let log_entry = LogEntry {
             term: self.state.current_term,
             index: self.log.len() as u32,
-            command: command,
-            client_id,
-            request_id,
+            command,
         };
 
         info!(
             log_index = log_entry.index,
             term = log_entry.term,
-            "appending set command to local log"
+            "appending proposed command to local log"
         );
         self.log.push(log_entry.clone());
+        self.commit_notifiers.insert(log_entry.index as i32, ack);
 
         for (peer_id, _) in &self.config.peer_node_addresses() {
             if *peer_id == self.id {
@@ -805,6 +870,28 @@ impl Server {
         Ok(())
     }
 
+    /// Awakened after every consensus round: processes queued proposals, which
+    /// works only when we are the leader. While a non-leader role has control,
+    /// it silently returns, and queued proposals are rejected by
+    /// `reject_pending_proposals` instead.
+    #[instrument(skip(self), fields(node_id = %self.id))]
+    async fn process_pending_proposals(&mut self) -> anyhow::Result<()> {
+        while let Ok(proposal) = self.proposal_queue.try_recv() {
+            if !matches!(self.state.state, RaftState::Leader { .. }) {
+                let _ = proposal.ack.send(Err(anyhow::anyhow!(
+                    "proposal rejected: node {} lost leadership before the proposal was processed",
+                    self.id
+                )));
+                return Ok(());
+            }
+
+            self.append_proposed_command_to_log(proposal.command, proposal.ack)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     #[instrument(skip(self, incoming), fields(node_id = %self.id))]
     async fn handle_append_entries_response(&mut self, incoming: Incoming) -> anyhow::Result<()> {
         let msg = incoming.msg;
@@ -830,9 +917,7 @@ impl Server {
             return Ok(());
         }
 
-        let Id::Peer(peer_id) = incoming.from else {
-            return Ok(());
-        };
+        let peer_id = incoming.from;
         let i = peer_id.as_usize();
 
         if msg.success {
@@ -933,27 +1018,10 @@ impl Server {
             };
             match_index[self.id.as_usize()] = self.state.commit_index;
 
-            let log_entry = match self.log.get(self.state.commit_index as usize) {
-                Some(entry) => entry,
-                None => return Ok(()),
-            };
-
-            let client_id = log_entry.client_id;
-            let request_id = log_entry.request_id;
-
             info!(
-                client_id = client_id,
-                request_id = request_id,
-                "sending success response back to client"
+                commit_index = self.state.commit_index,
+                "committed entry applied; pending propose() callers acked"
             );
-            self.to_network
-                .send(Outgoing {
-                    dest: Destination::Client(ClientId(client_id)),
-                    msg: Message::ClientResponseType(ClientResponse::Success {
-                        request_id: request_id as u64,
-                    }),
-                })
-                .await?;
         }
 
         Ok(())
@@ -975,6 +1043,8 @@ impl Server {
 async fn set_timer(timeout_duration: tokio::time::Duration) {
     tokio::time::sleep(timeout_duration).await;
 }
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
@@ -1018,7 +1088,6 @@ mod tests {
             total_nodes: 5,
             peer_addresses: peer_addreses,
             node_id: 0,
-            client_listener_address: "127.0.0.1:8080".to_string(),
             peer_listener_address: "127.0.0.1:9001".to_string(),
         };
         let state_machine = SimpleStateMachine::default();
@@ -1040,7 +1109,7 @@ mod tests {
     async fn populate_follower_log(mock_adapter_tx: &mpsc::Sender<Incoming>) {
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1050,8 +1119,6 @@ mod tests {
                         term: 1,
                         command: Bytes::from("test-command"),
                         index: 0,
-                        client_id: 67,
-                        request_id: 67,
                     }],
                     leader_commit: 0,
                 }),
@@ -1075,7 +1142,7 @@ mod tests {
         let (mut server, mock_adapter_tx, _) = create_new_server_and_mock_msg_sender();
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1109,7 +1176,7 @@ mod tests {
 
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1119,8 +1186,6 @@ mod tests {
                         term: 1,
                         command: Bytes::from("conflicting-command"),
                         index: 0,
-                        client_id: 67,
-                        request_id: 67,
                     }],
                     leader_commit: 0,
                 }),
@@ -1155,19 +1220,15 @@ mod tests {
             term: 1,
             command: Bytes::from("cmd1"),
             index: 1,
-            client_id: 67,
-            request_id: 67,
         };
         let second_log_entry = LogEntry {
             term: 1,
             command: Bytes::from("cmd2"),
             index: 2,
-            client_id: 67,
-            request_id: 67,
         };
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: 1,
                     leader_id: NodeId(1),
@@ -1210,7 +1271,7 @@ mod tests {
 
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::RequestVoteType(RequestVote {
                     term: 2,
                     candidate_id: NodeId(2),
@@ -1247,7 +1308,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(99)),
+                from: NodeId(99),
                 msg: heartbeat,
             })
             .await
@@ -1284,7 +1345,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(99)),
+                from: NodeId(99),
                 msg: heartbeat,
             })
             .await
@@ -1327,7 +1388,7 @@ mod tests {
         });
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: higher_term_msg,
             })
             .await
@@ -1359,7 +1420,7 @@ mod tests {
 
             mock_adapter_tx
                 .send(Incoming {
-                    from: Id::Peer(NodeId(67)),
+                    from: NodeId(67),
                     msg: higher_term_msg,
                 })
                 .await
@@ -1390,7 +1451,7 @@ mod tests {
         for _ in 0..(server.config.total_nodes / 2) + 1 {
             mock_adapter_tx
                 .send(Incoming {
-                    from: Id::Peer(NodeId(67)),
+                    from: NodeId(67),
                     msg: Message::RequestVoteResponseType(RequestVoteResponse {
                         term: server.state.current_term,
                         vote_granted: true,
@@ -1414,31 +1475,34 @@ mod tests {
 
         simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
 
-        let client_request = Incoming {
-            from: Id::Peer(NodeId(67)),
-            msg: Message::ClientRequestType(ClientRequest {
-                request_id: 67,
-                client_id: 6,
+        // Submit a command through the direct-`propose` path instead of a
+        // networked client request.
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        server
+            .proposals
+            .send(Proposal {
                 command: Bytes::from("test-bytes"),
-            }),
-        };
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
 
         let node_1_response = Incoming {
-            from: Id::Peer(NodeId(1)),
+            from: NodeId(1),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response = Incoming {
-            from: Id::Peer(NodeId(2)),
+            from: NodeId(2),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_3_response = Incoming {
-            from: Id::Peer(NodeId(3)),
+            from: NodeId(3),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
@@ -1446,7 +1510,7 @@ mod tests {
         };
 
         let higher_term_msg = Incoming {
-            from: Id::Peer(NodeId(8)),
+            from: NodeId(8),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1458,7 +1522,6 @@ mod tests {
         };
 
         let msg_to_send = vec![
-            client_request,
             node_1_response,
             node_2_response,
             node_3_response,
@@ -1470,6 +1533,8 @@ mod tests {
 
         server.leader().await;
         assert_eq!(server.state.commit_index, 0);
+        // The proposal must have been acked once committed and applied.
+        let _ = ack_rx.try_recv().unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1479,24 +1544,27 @@ mod tests {
 
         simulate_follower_becomes_leader(&mut server, &mock_adapter_tx, &mut mock_adapter_rx).await;
 
-        let client_request1 = Incoming {
-            from: Id::Peer(NodeId(67)),
-            msg: Message::ClientRequestType(ClientRequest {
-                request_id: 67,
-                client_id: 6,
+        // Submit a command through the direct-`propose` path instead of a
+        // networked client request.
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        server
+            .proposals
+            .send(Proposal {
                 command: Bytes::from("cmd1"),
-            }),
-        };
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
 
         let node_1_response = Incoming {
-            from: Id::Peer(NodeId(1)),
+            from: NodeId(1),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response = Incoming {
-            from: Id::Peer(NodeId(2)),
+            from: NodeId(2),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
@@ -1504,7 +1572,7 @@ mod tests {
         };
 
         let higher_term_msg = Incoming {
-            from: Id::Peer(NodeId(67)),
+            from: NodeId(67),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1516,7 +1584,6 @@ mod tests {
         };
 
         let msg_to_send = vec![
-            client_request1,
             node_1_response,
             node_2_response,
             higher_term_msg.clone(),
@@ -1524,9 +1591,12 @@ mod tests {
         for msg in msg_to_send {
             mock_adapter_tx.send(msg).await.unwrap();
         }
+
         server.leader().await;
 
         assert_eq!(server.state.commit_index, 0);
+        // The proposal must have been acked once committed and applied.
+        let _ = ack_rx.try_recv().unwrap().unwrap();
 
         warn!("changing node state back to leader, for running further test");
         server.state.state = RaftState::Leader {
@@ -1534,44 +1604,45 @@ mod tests {
             next_index: vec![0, server.config.total_nodes as u64 + 1],
         };
 
-        let client_request2 = Incoming {
-            from: Id::Peer(NodeId(69)),
-            msg: Message::ClientRequestType(ClientRequest {
-                request_id: 69,
-                client_id: 7,
+        let (ack_tx2, mut ack_rx2) = oneshot::channel();
+        server
+            .proposals
+            .send(Proposal {
                 command: Bytes::from("cmd2"),
-            }),
-        };
+                ack: ack_tx2,
+            })
+            .await
+            .unwrap();
         let node_1_response2 = Incoming {
-            from: Id::Peer(NodeId(1)),
+            from: NodeId(1),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_2_response2 = Incoming {
-            from: Id::Peer(NodeId(2)),
+            from: NodeId(2),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let node_3_second_log_failure = Incoming {
-            from: Id::Peer(NodeId(3)),
+            from: NodeId(3),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: false,
             }),
         };
         let node_3_second_log_success = Incoming {
-            from: Id::Peer(NodeId(3)),
+            from: NodeId(3),
             msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                 term: server.state.current_term,
                 success: true,
             }),
         };
         let higher_term_msg = Incoming {
-            from: Id::Peer(NodeId(67)),
+            from: NodeId(67),
             msg: Message::AppendEntriesType(AppendEntries {
                 term: server.state.current_term + 1,
                 leader_id: NodeId(4),
@@ -1582,7 +1653,6 @@ mod tests {
             }),
         };
         let msg_to_send_again = vec![
-            client_request2,
             node_1_response2,
             node_2_response2,
             node_3_second_log_failure,
@@ -1595,6 +1665,7 @@ mod tests {
 
         server.leader().await;
         assert_eq!(server.state.commit_index, 1);
+        let _ = ack_rx2.try_recv().unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1609,7 +1680,7 @@ mod tests {
 
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(3)),
+                from: NodeId(3),
                 msg: Message::AppendEntriesResponseType(AppendEntriesResponse {
                     term: server.state.current_term - 1,
                     success: true,
@@ -1619,7 +1690,7 @@ mod tests {
             .unwrap();
         mock_adapter_tx
             .send(Incoming {
-                from: Id::Peer(NodeId(67)),
+                from: NodeId(67),
                 msg: Message::AppendEntriesType(AppendEntries {
                     term: server.state.current_term + 1,
                     leader_id: NodeId(1),

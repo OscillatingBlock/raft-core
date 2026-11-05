@@ -15,7 +15,6 @@ pub struct ServerConfig {
     pub total_nodes: u32,
     pub peer_addresses: HashMap<u64, String>,
     pub node_id: u64,
-    pub client_listener_address: String,
     pub peer_listener_address: String,
 }
 

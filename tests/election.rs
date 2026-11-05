@@ -18,7 +18,6 @@ fn test_config(node_id: u64, election_timeout_ms: u64) -> ServerConfig {
         total_nodes: 3,
         peer_addresses: HashMap::new(),
         node_id,
-        client_listener_address: "127.0.0.1:0".to_string(),
         peer_listener_address: "127.0.0.1:0".to_string(),
     }
 }

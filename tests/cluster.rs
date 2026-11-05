@@ -6,9 +6,9 @@ use std::{
 
 use bytes::Bytes;
 use mini_raft::{
-    codec::{ClientRequest, ClientResponse, Message},
+    codec::Message,
     config::ServerConfig,
-    server::{Destination, Id, Incoming, NodeId, Outgoing, Server},
+    server::{Destination, Incoming, NodeId, Outgoing, RaftNode, Server},
     state_machine::StateMachine,
 };
 use std::sync::RwLock;
@@ -46,7 +46,7 @@ impl StateMachine for TestStateMachine {
 
 struct NodeHandles {
     id: NodeId,
-    to_server: mpsc::Sender<Incoming>,
+    node: RaftNode,
     state_machine: Arc<TestStateMachine>,
 }
 
@@ -62,20 +62,17 @@ fn node_config(node_id: u64, election_timeout_ms: u64) -> ServerConfig {
         total_nodes: 3,
         peer_addresses: peers,
         node_id,
-        client_listener_address: "127.0.0.1:0".to_string(),
         peer_listener_address: "127.0.0.1:0".to_string(),
     }
 }
 
 /// Mesh router: delivers Outgoing from any node to the right Incoming queue.
-/// Also forwards Client responses and a copy of every message to observers.
+/// Also forwards a copy of every message to observers.
 async fn router(
     mut from_servers: Vec<(NodeId, mpsc::Receiver<Outgoing>)>,
     to_servers: HashMap<NodeId, mpsc::Sender<Incoming>>,
-    client_tx: mpsc::Sender<(u32, Message)>,
     observe_tx: mpsc::UnboundedSender<(NodeId, Message)>,
 ) {
-    let id_of = |nid: NodeId| nid;
     loop {
         let mut progressed = false;
         for (sender_id, rx) in from_servers.iter_mut() {
@@ -89,7 +86,7 @@ async fn router(
                             if let Some(tx) = to_servers.get(&peer) {
                                 let _ = tx
                                     .send(Incoming {
-                                        from: Id::Peer(id_of(sid)),
+                                        from: sid,
                                         msg: out.msg,
                                     })
                                     .await;
@@ -102,15 +99,11 @@ async fn router(
                                 }
                                 let _ = tx
                                     .send(Incoming {
-                                        from: Id::Peer(id_of(sid)),
+                                        from: sid,
                                         msg: out.msg.clone(),
                                     })
                                     .await;
                             }
-                        }
-                        Destination::Client(cid) => {
-                            let _ = client_tx.send((0, out.msg)).await;
-                            let _ = cid;
                         }
                     }
                 }
@@ -126,14 +119,12 @@ async fn router(
 
 async fn spawn_cluster() -> (
     Vec<NodeHandles>,
-    mpsc::Receiver<(u32, Message)>,
     mpsc::UnboundedReceiver<(NodeId, Message)>,
 ) {
     let timeouts = [150u64, 300, 450];
     let mut to_servers = HashMap::new();
     let mut from_servers = Vec::new();
     let mut handles = Vec::new();
-    let (client_tx, client_rx) = mpsc::channel(32);
     let (observe_tx, observe_rx) = mpsc::unbounded_channel();
 
     for i in 0..3u64 {
@@ -141,31 +132,33 @@ async fn spawn_cluster() -> (
         let (to_net_tx, from_srv_rx) = mpsc::channel::<Outgoing>(64);
         let (to_srv_tx, from_net_rx) = mpsc::channel::<Incoming>(64);
         let sm = Arc::new(TestStateMachine::new());
-        let server = Server::new(
+        let mut server = Server::new(
             id,
             node_config(i, timeouts[i as usize]),
             sm.clone(),
             to_net_tx,
             from_net_rx,
         );
+        let node = server.raft_node();
         tokio::spawn(async move {
-            let mut s = server;
-            s.run().await;
+            server.run().await;
         });
         to_servers.insert(id, to_srv_tx.clone());
         from_servers.push((id, from_srv_rx));
         handles.push(NodeHandles {
             id,
-            to_server: to_srv_tx,
+            node,
             state_machine: sm,
         });
     }
 
-    tokio::spawn(router(from_servers, to_servers, client_tx, observe_tx));
+    tokio::spawn(router(from_servers, to_servers, observe_tx));
 
-    (handles, client_rx, observe_rx)
+    (handles, observe_rx)
 }
 
+/// Observes heartbeats until exactly one node has been sending them
+/// for a while — that node is the stable leader.
 async fn elect_leader(observe_rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)>) -> NodeId {
     let mut senders = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
@@ -203,51 +196,24 @@ async fn elect_leader(observe_rx: &mut mpsc::UnboundedReceiver<(NodeId, Message)
 
 #[tokio::test]
 async fn three_nodes_elect_single_leader() {
-    let (_nodes, _client_rx, mut observe_rx) = spawn_cluster().await;
+    let (_nodes, mut observe_rx) = spawn_cluster().await;
     let leader = elect_leader(&mut observe_rx).await;
     assert!(leader == NodeId::new(0) || leader == NodeId::new(1) || leader == NodeId::new(2));
 }
 
+/// The new direct-call API: a leader proposes a command, it commits and
+/// replicates to every node without any client TCP layer.
 #[tokio::test]
-async fn leader_replicates_client_set_to_all_nodes() {
-    let (nodes, mut client_rx, mut observe_rx) = spawn_cluster().await;
+async fn leader_propose_commits_and_replicates_to_all_nodes() {
+    let (nodes, mut observe_rx) = spawn_cluster().await;
     let leader = elect_leader(&mut observe_rx).await;
 
     let leader_handle = nodes.iter().find(|n| n.id == leader).unwrap();
     leader_handle
-        .to_server
-        .send(Incoming {
-            from: Id::Peer(NodeId::new(99)),
-            msg: Message::ClientRequestType(ClientRequest {
-                command: Bytes::from("foo=bar"),
-                client_id: 42,
-                request_id: 7,
-            }),
-        })
+        .node
+        .propose(Bytes::from("foo=bar"))
         .await
-        .unwrap();
-
-    let mut got_success = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, client_rx.recv()).await {
-            Ok(Some((_cid, Message::ClientResponseType(resp)))) => match resp {
-                ClientResponse::Success { request_id } => {
-                    assert_eq!(request_id, 7);
-                    got_success = true;
-                    break;
-                }
-                other => panic!("unexpected client response: {:?}", other),
-            },
-            Ok(Some((_cid, other))) => {
-                panic!("expected ClientResponse, got {}", other.message_type())
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    assert!(got_success, "leader did not commit client command");
+        .expect("leader should accept and commit the proposed command");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
@@ -263,4 +229,24 @@ async fn leader_replicates_client_set_to_all_nodes() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A follower must reject proposals with an error instead of accepting them.
+#[tokio::test]
+async fn propose_on_non_leader_is_rejected() {
+    let (nodes, mut observe_rx) = spawn_cluster().await;
+    let leader = elect_leader(&mut observe_rx).await;
+
+    let follower_handle = nodes.iter().find(|n| n.id != leader).unwrap();
+    let result = follower_handle
+        .node
+        .propose(Bytes::from("foo=bar"))
+        .await
+        .err()
+        .expect("follower proposal should be rejected, not committed");
+
+    assert!(
+        result.to_string().contains("not the leader"),
+        "unexpected error: {result}"
+    );
 }

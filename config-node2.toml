@@ -3,9 +3,7 @@ heartbeat_interval = 200
 address = "127.0.0.1"
 total_nodes = 5
 node_id = 2
-client_listener_address = "127.0.0.1:8082"
 peer_listener_address = "127.0.0.1:9002"
-
 [peer_addresses]
 1 = "127.0.0.1:9001"
 2 = "127.0.0.1:9002"

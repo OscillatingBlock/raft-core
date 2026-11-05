@@ -12,7 +12,7 @@ use tokio_util::codec::Framed;
 
 use crate::{
     codec::{Codec, Hello, Message},
-    server::{ClientId, Destination, Id, Incoming, NodeId, Outgoing},
+    server::{Destination, Incoming, NodeId, Outgoing},
 };
 
 pub struct NetworkManager {
@@ -23,11 +23,10 @@ pub struct NetworkManager {
     id: NodeId,
 }
 
-// thread safe mapping of client and peer id to their writer tasks
+// thread safe mapping of peer id to their writer tasks
 // receiving end are used by writer task
 struct ConnectionRegistry {
     peer_registry: Arc<Mutex<HashMap<NodeId, mpsc::Sender<Message>>>>,
-    client_registry: Arc<Mutex<HashMap<ClientId, mpsc::Sender<Message>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,36 +38,23 @@ pub enum ConnectionRole {
 impl ConnectionRegistry {
     fn new() -> Self {
         let peer_registry_map: HashMap<NodeId, mpsc::Sender<Message>> = HashMap::new();
-        let client_registry_map: HashMap<ClientId, mpsc::Sender<Message>> = HashMap::new();
         Self {
             peer_registry: Arc::new(Mutex::new(peer_registry_map)),
-            client_registry: Arc::new(Mutex::new(client_registry_map)),
         }
     }
 
-    async fn register(&self, id: Id) -> mpsc::Receiver<Message> {
+    async fn register(&self, peer_id: NodeId) -> mpsc::Receiver<Message> {
         let (tx, rx) = mpsc::channel::<Message>(32);
-        match id {
-            Id::Client(client_id) => {
-                self.client_registry.lock().await.insert(client_id, tx);
-                debug!(target: "network", ?client_id, "registered client sender channel");
-            }
-            Id::Peer(peer_id) => {
-                self.peer_registry.lock().await.insert(peer_id, tx);
-                debug!(target: "network", ?peer_id, "registered peer sender channel");
-            }
-        }
+        self.peer_registry.lock().await.insert(peer_id, tx);
+        debug!(target: "network", ?peer_id, "registered peer sender channel");
         rx
     }
 
-    async fn send(&self, id: &Id, msg: Message) -> anyhow::Result<()> {
-        let tx = match id {
-            Id::Client(client_id) => self.client_registry.lock().await.get(client_id).cloned(),
-            Id::Peer(peer_id) => self.peer_registry.lock().await.get(peer_id).cloned(),
-        };
+    async fn send(&self, peer_id: &NodeId, msg: Message) -> anyhow::Result<()> {
+        let tx = self.peer_registry.lock().await.get(peer_id).cloned();
 
         let Some(tx) = tx else {
-            anyhow::bail!("writer channel not available for id: {:?}", id);
+            anyhow::bail!("writer channel not available for peer id: {:?}", peer_id);
         };
 
         tx.send(msg).await?;
@@ -120,8 +106,8 @@ impl NetworkManager {
         addr: String,
         role: ConnectionRole,
     ) {
-        let id = match self.perform_handshake(&mut framed).await {
-            Ok(Some(id)) => id,
+        let peer_id = match self.perform_handshake(&mut framed).await {
+            Ok(Some(peer_id)) => peer_id,
             Ok(None) => {
                 match role {
                     ConnectionRole::Inbound => {
@@ -148,35 +134,31 @@ impl NetworkManager {
 
         match role {
             ConnectionRole::Inbound => {
-                info!(target: "network", ?id, ?addr, "inbound handshake successful, spawning connection handlers");
+                info!(target: "network", ?peer_id, ?addr, "inbound handshake successful, spawning connection handlers");
             }
             ConnectionRole::Outbound => {
-                info!(target: "network", ?id, ?addr, "outbound peer dial and handshake completed successfully");
+                info!(target: "network", ?peer_id, ?addr, "outbound peer dial and handshake completed successfully");
             }
         }
 
-        let rx = self.connections_map.register(id.clone()).await;
-        self.spawn_reader_writer_tasks(framed, id, rx).await;
+        let rx = self.connections_map.register(peer_id).await;
+        self.spawn_reader_writer_tasks(framed, peer_id, rx).await;
     }
 
     #[instrument(skip(self, conn), fields(node_id = ?self.id))]
     async fn perform_handshake(
         &self,
         conn: &mut Framed<TcpStream, Codec>,
-    ) -> anyhow::Result<Option<Id>> {
+    ) -> anyhow::Result<Option<NodeId>> {
         debug!(target: "network", "sending hello message for handshake initialization");
         conn.send(Message::HelloType(Hello { id: self.id })).await?;
 
         let msg = self.read_hello_response(conn).await?;
 
-        let id = match msg {
+        let peer_id = match msg {
             Some(Message::HelloType(hello)) => {
                 info!(target: "network", peer_id = ?hello.id, "identified remote connection as peer node");
-                Id::Peer(hello.id)
-            }
-            Some(Message::HelloClientType(hello)) => {
-                info!(target: "network", client_id = ?hello.id, "identified remote connection as client");
-                Id::Client(hello.id)
+                hello.id
             }
             Some(other) => {
                 warn!(target: "network", message_type = ?other, "received unexpected message type during handshake");
@@ -187,7 +169,7 @@ impl NetworkManager {
             }
         };
 
-        Ok(Some(id))
+        Ok(Some(peer_id))
     }
 
     async fn read_hello_response(
@@ -261,54 +243,54 @@ impl NetworkManager {
         return Some(c);
     }
 
-    #[instrument(skip(self, conn), fields(node_id = ?self.id, ?id))]
+    #[instrument(skip(self, conn), fields(node_id = ?self.id, ?peer_id))]
     async fn spawn_reader_writer_tasks(
         &self,
         conn: Framed<TcpStream, Codec>,
-        id: Id,
+        peer_id: NodeId,
         rx: mpsc::Receiver<Message>,
     ) {
         let (sink, stream) = conn.split();
         let to_server = self.to_server.clone();
 
         tokio::spawn(async move {
-            debug!(target: "network", ?id, "spawned framed_reader background task");
-            framed_reader(stream, id, to_server.clone()).await;
-            debug!(target: "network", ?id, "framed_reader task terminated");
+            debug!(target: "network", ?peer_id, "spawned framed_reader background task");
+            framed_reader(stream, peer_id, to_server.clone()).await;
+            debug!(target: "network", ?peer_id, "framed_reader task terminated");
         });
 
         tokio::spawn(async move {
-            debug!(target: "network", ?id, "spawned framed_writer background task");
+            debug!(target: "network", ?peer_id, "spawned framed_writer background task");
             framed_writer(sink, rx).await;
-            debug!(target: "network", ?id, "framed_writer task terminated");
+            debug!(target: "network", ?peer_id, "framed_writer task terminated");
         });
     }
 }
 
-#[instrument(skip(framed_stream, to_server), fields(?id))]
+#[instrument(skip(framed_stream, to_server), fields(?peer_id))]
 async fn framed_reader(
     mut framed_stream: SplitStream<Framed<TcpStream, Codec>>,
-    id: Id,
+    peer_id: NodeId,
     to_server: Arc<mpsc::Sender<Incoming>>,
 ) {
     while let Some(msg) = framed_stream.next().await {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                error!(target: "network", ?id, error = %e, "error decoding frame from stream, skipping frame");
+                error!(target: "network", ?peer_id, error = %e, "error decoding frame from stream, skipping frame");
                 continue;
             }
         };
 
-        let incoming_msg = Incoming { from: id, msg };
-        debug!(target: "network", ?id, "forwarding incoming message to server pipeline");
+        let incoming_msg = Incoming { from: peer_id, msg };
+        debug!(target: "network", ?peer_id, "forwarding incoming message to server pipeline");
 
         if let Err(e) = to_server.send(incoming_msg).await {
-            error!(target: "network", ?id, error = %e, "server input channel closed, terminating reader loop");
+            error!(target: "network", ?peer_id, error = %e, "server input channel closed, terminating reader loop");
             return;
         }
     }
-    warn!(target: "network", ?id, "remote stream ended (EOF)");
+    warn!(target: "network", ?peer_id, "remote stream ended (EOF)");
 }
 
 #[instrument(skip(framed_sink, from_dispatcher))]
@@ -334,28 +316,20 @@ pub async fn dispatch_server_msg(
     while let Some(msg) = from_server.recv().await {
         match msg.dest {
             Destination::Node(node_id) => {
-                let id = Id::Peer(node_id);
-                if let Err(e) = network_manager.connections_map.send(&id, msg.msg).await {
-                    error!(target: "network", ?id, error = %e, "failed to dispatch message to peer");
-                }
-            }
-            Destination::Client(client_id) => {
-                let id = Id::Client(client_id);
-                if let Err(e) = network_manager.connections_map.send(&id, msg.msg).await {
-                    error!(target: "network", ?id, error = %e, "failed to dispatch message to client");
+                if let Err(e) = network_manager.connections_map.send(&node_id, msg.msg).await {
+                    error!(target: "network", ?node_id, error = %e, "failed to dispatch message to peer");
                 }
             }
             Destination::Broadcast => {
                 let nodes = network_manager.connections_map.get_all_peers().await;
                 info!(target: "network", peer_count = nodes.len(), "broadcasting message to all connected peers");
                 for node_id in nodes {
-                    let id = Id::Peer(node_id);
                     if let Err(e) = network_manager
                         .connections_map
-                        .send(&id, msg.msg.clone())
+                        .send(&node_id, msg.msg.clone())
                         .await
                     {
-                        error!(target: "network", ?id, error = %e, "failed to broadcast message to peer");
+                        error!(target: "network", ?node_id, error = %e, "failed to broadcast message to peer");
                     }
                 }
             }

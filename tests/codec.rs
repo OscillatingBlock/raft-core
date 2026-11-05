@@ -1,7 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use mini_raft::codec::{
-    AppendEntries, AppendEntriesResponse, ClientRequest, ClientResponse, Codec, Hello, HelloClient,
-    Message, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, Codec, Hello, Message, RequestVote, RequestVoteResponse,
 };
 use mini_raft::server::{LogEntry, NodeId};
 use tokio_util::codec::{Decoder, Encoder};
@@ -48,8 +47,6 @@ fn codec_roundtrips_all_variants() {
                 term: 3,
                 command: Bytes::from("cmd"),
                 index: 1,
-                client_id: 7,
-                request_id: 9,
             }],
             leader_commit: 0,
         }),
@@ -67,16 +64,7 @@ fn codec_roundtrips_all_variants() {
             term: 2,
             vote_granted: true,
         }),
-        Message::ClientRequestType(ClientRequest {
-            command: Bytes::from("cmd1"),
-            client_id: 42,
-            request_id: 1,
-        }),
-        Message::ClientResponseType(ClientResponse::Success { request_id: 1 }),
         Message::HelloType(Hello { id: NodeId::new(1) }),
-        Message::HelloClientType(HelloClient {
-            id: mini_raft::server::ClientId::new(99),
-        }),
     ];
 
     for m in msgs {

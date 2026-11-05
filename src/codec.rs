@@ -1,4 +1,4 @@
-use crate::server::{ClientId, LogEntry, NodeId};
+use crate::server::{LogEntry, NodeId};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio::io;
@@ -10,10 +10,7 @@ pub enum Message {
     AppendEntriesResponseType(AppendEntriesResponse),
     RequestVoteType(RequestVote),
     RequestVoteResponseType(RequestVoteResponse),
-    ClientRequestType(ClientRequest),
-    ClientResponseType(ClientResponse),
     HelloType(Hello),
-    HelloClientType(HelloClient),
 }
 
 impl Message {
@@ -23,10 +20,7 @@ impl Message {
             Message::AppendEntriesResponseType(_) => "AppendEntriesResponseType".to_string(),
             Message::RequestVoteType(_) => "RequestVoteType".to_string(),
             Message::RequestVoteResponseType(_) => "RequestVoteResponseType".to_string(),
-            Message::ClientRequestType(_) => "ClientRequestType".to_string(),
-            Message::ClientResponseType(_) => "ClientResponseType".to_string(),
             Message::HelloType(_) => "HelloType".to_string(),
-            Message::HelloClientType(_) => "HelloClientType".to_string(),
         }
     }
 }
@@ -62,27 +56,8 @@ pub struct RequestVoteResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientRequest {
-    pub command: bytes::Bytes,
-    pub client_id: u32,
-    pub request_id: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub id: NodeId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HelloClient {
-    pub id: ClientId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClientResponse {
-    // Success responses for each operation
-    Success { request_id: u64 },
-    InternalError { request_id: u64, reason: String },
 }
 
 #[derive(Clone)]
