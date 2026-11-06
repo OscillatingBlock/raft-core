@@ -209,6 +209,17 @@ async fn leader_propose_commits_and_replicates_to_all_nodes() {
     let leader = elect_leader(&mut observe_rx).await;
 
     let leader_handle = nodes.iter().find(|n| n.id == leader).unwrap();
+    assert!(
+        leader_handle.node.is_leader(),
+        "handle must report leadership once a leader was elected"
+    );
+    for follower in nodes.iter().filter(|n| n.id != leader) {
+        assert!(
+            !follower.node.is_leader(),
+            "inactive follower handle must report non-leadership"
+        );
+    }
+
     leader_handle
         .node
         .propose(Bytes::from("foo=bar"))

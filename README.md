@@ -108,7 +108,17 @@ use bytes::Bytes;
 // Resolves with Ok(()) once the command is committed by a majority
 // and applied to the local state machine:
 raft_node.propose(Bytes::from("ADD write the readme")).await?;
+
+// Cheap, non-blocking check of this node's current role:
+if raft_node.is_leader() {
+    // this handle's node is the cluster leader
+}
 ```
+
+Semantics of `is_leader`: it is eventually-consistent — it reads a `watch::Receiver`
+that the consensus loop refreshes once per dispatch, so it can lag a role change by
+a fraction of a loop iteration. Use it for routing/health decisions; the errors
+returned by `propose()` remain the authoritative per-command outcome.
 
 Semantics of `propose`:
 

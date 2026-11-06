@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{
         mpsc::{self},
-        oneshot,
+        oneshot, watch,
     },
     time::Instant,
 };
@@ -34,6 +34,9 @@ pub struct Server {
     /// One `ack` per un-applied leader proposal; completed when the command
     /// commits and is applied to the state machine.
     commit_notifiers: HashMap<i32, oneshot::Sender<anyhow::Result<()>>>,
+    /// Published to on every role change so `RaftNode::is_leader` can observe
+    /// leadership from other tasks without touching `ServerState` directly.
+    leadership_tx: watch::Sender<bool>,
 }
 
 #[allow(dead_code)]
@@ -149,6 +152,8 @@ pub struct Proposal {
 pub struct RaftNode {
     pub id: NodeId,
     proposals: mpsc::Sender<Proposal>,
+    /// Streams every leadership change of the node; `is_leader()` reads it.
+    leadership: watch::Receiver<bool>,
 }
 
 impl Server {
@@ -158,6 +163,7 @@ impl Server {
         RaftNode {
             id: self.id,
             proposals: self.proposals.clone(),
+            leadership: self.leadership_tx.subscribe(),
         }
     }
 
@@ -181,6 +187,15 @@ impl RaftNode {
     /// command to the current leader or retry).
     pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<()> {
         enqueue_proposal(&self.proposals, command.into()).await
+    }
+
+    /// Reports whether this handle's node currently holds leadership.
+    ///
+    /// The returned value is eventually-consistent: it lags a role change by
+    /// at most one consensus-loop iteration. Consult [`Self::propose`] errors
+    /// for the authoritative per-command outcome.
+    pub fn is_leader(&self) -> bool {
+        *self.leadership.borrow()
     }
 }
 
@@ -225,6 +240,7 @@ impl Server {
             proposal_queue,
             proposals,
             commit_notifiers: HashMap::new(),
+            leadership_tx: watch::channel(false).0,
         }
     }
 
@@ -232,6 +248,7 @@ impl Server {
     pub async fn run(&mut self) {
         info!("starting server main loop");
         loop {
+            self.publish_role();
             match &self.state.state {
                 RaftState::Follower {} => self.follower().await,
                 RaftState::Candidate { votes_received: _ } => self.candidate().await,
@@ -243,15 +260,18 @@ impl Server {
         }
     }
 
-    pub fn is_leader(&self) -> bool {
-        if let RaftState::Leader {
-            match_index: _,
-            next_index: _,
-        } = &self.state.state
-        {
-            return true;
-        }
-        return false;
+    /// Publishes the current role to `RaftNode::is_leader` watchers. Called
+    /// at every top-of-loop dispatch, which is the one place all role
+    /// transitions funnel through (state functions exit on a role change).
+    fn publish_role(&mut self) {
+        let is_leader = matches!(self.state.state, RaftState::Leader { .. });
+        self.leadership_tx.send_if_modified(|current| {
+            if *current == is_leader {
+                return false;
+            }
+            *current = is_leader;
+            true
+        });
     }
 
     /// Rejects every queued proposal. Called whenever this node takes on a
