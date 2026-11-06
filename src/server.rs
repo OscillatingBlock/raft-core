@@ -1,7 +1,5 @@
 use crate::{
-    codec::{
-        AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,
-    },
+    codec::{AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse},
     config::ServerConfig,
 };
 use anyhow::Context;
@@ -9,7 +7,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{mpsc::{self}, oneshot},
+    sync::{
+        mpsc::{self},
+        oneshot,
+    },
     time::Instant,
 };
 use tracing::{debug, field::debug, info, instrument, warn};
@@ -183,7 +184,10 @@ impl RaftNode {
     }
 }
 
-async fn enqueue_proposal(proposals: &mpsc::Sender<Proposal>, command: Bytes) -> anyhow::Result<()> {
+async fn enqueue_proposal(
+    proposals: &mpsc::Sender<Proposal>,
+    command: Bytes,
+) -> anyhow::Result<()> {
     let (ack_tx, ack_rx) = oneshot::channel();
     proposals
         .send(Proposal {
@@ -237,6 +241,17 @@ impl Server {
                 } => self.leader().await,
             }
         }
+    }
+
+    pub fn is_leader(&self) -> bool {
+        if let RaftState::Leader {
+            match_index: _,
+            next_index: _,
+        } = &self.state.state
+        {
+            return true;
+        }
+        return false;
     }
 
     /// Rejects every queued proposal. Called whenever this node takes on a
@@ -806,7 +821,11 @@ impl Server {
     /// The command's ack is stored in `commit_notifiers` and fires (in
     /// `apply_latest_commited_logs`) once the majority commits and it is applied.
     #[instrument(skip(self), fields(node_id = %self.id, command = ?command))]
-    async fn append_proposed_command_to_log(&mut self, command: Bytes, ack: oneshot::Sender<anyhow::Result<()>>) -> anyhow::Result<()> {
+    async fn append_proposed_command_to_log(
+        &mut self,
+        command: Bytes,
+        ack: oneshot::Sender<anyhow::Result<()>>,
+    ) -> anyhow::Result<()> {
         let RaftState::Leader {
             match_index: _,
             next_index,
@@ -1583,11 +1602,7 @@ mod tests {
             }),
         };
 
-        let msg_to_send = vec![
-            node_1_response,
-            node_2_response,
-            higher_term_msg.clone(),
-        ];
+        let msg_to_send = vec![node_1_response, node_2_response, higher_term_msg.clone()];
         for msg in msg_to_send {
             mock_adapter_tx.send(msg).await.unwrap();
         }
