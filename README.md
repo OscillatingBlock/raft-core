@@ -58,7 +58,7 @@ impl StateMachine for TodoList {
         if let Some(item) = cmd.strip_prefix("ADD ") {
             self.items.write().unwrap().push(item.into());
         }
-        Ok(Bytes::new()) // optional per-command result
+        Ok(Bytes::new()) // this value is what `propose()` returns on success
     }
 }
 ```
@@ -105,9 +105,10 @@ commands can hold its own copy of the handle.
 ```rust
 use bytes::Bytes;
 
-// Resolves with Ok(()) once the command is committed by a majority
-// and applied to the local state machine:
-raft_node.propose(Bytes::from("ADD write the readme")).await?;
+// Resolves once the command is committed by a majority and applied to the
+// local state machine. The returned Bytes are whatever apply_log produced
+// for this command:
+let applied: Bytes = raft_node.propose(Bytes::from("ADD write the readme")).await?;
 
 // Cheap, non-blocking check of this node's current role:
 if raft_node.is_leader() {
@@ -124,9 +125,10 @@ Semantics of `propose`:
 
 | Result | Meaning |
 |---|---|
-| `Ok(())` | Command was committed by a majority and applied locally |
+| `Ok(applied)` | Command was committed by a majority and applied locally; `applied` is the state machine's `apply_log` output for this command |
 | `Err` — "not the leader" | The node is not the leader; the proposal was rejected |
 | `Err` — "lost leadership" | The node lost leadership before the command committed |
+| `Err` — "failed to apply" | `apply_log` errored for this command; the state machine rejected it |
 | `Err` — "proposal queue closed" | The node is shutting down |
 
 Two practical notes:

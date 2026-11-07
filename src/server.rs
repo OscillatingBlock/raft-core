@@ -31,9 +31,10 @@ pub struct Server {
     proposal_queue: mpsc::Receiver<Proposal>,
     /// Submission end of the proposal queue (handed out by `propose`/`raft_node`).
     proposals: mpsc::Sender<Proposal>,
-    /// One `ack` per un-applied leader proposal; completed when the command
-    /// commits and is applied to the state machine.
-    commit_notifiers: HashMap<i32, oneshot::Sender<anyhow::Result<()>>>,
+    /// One ack per un-applied leader proposal; receives the bytes produced by
+    /// `apply_log` when the command commits and is applied to the state
+    /// machine, or an error if the proposal is rejected / does not apply.
+    commit_notifiers: HashMap<i32, oneshot::Sender<anyhow::Result<Bytes>>>,
     /// Published to on every role change so `RaftNode::is_leader` can observe
     /// leadership from other tasks without touching `ServerState` directly.
     leadership_tx: watch::Sender<bool>,
@@ -138,13 +139,14 @@ pub struct Incoming {
 }
 
 /// A user-submitted command awaiting replication through the Raft protocol.
-/// `ack` resolves once the command has been committed by a majority and applied
-/// to the state machine, or carries an error if the proposal is rejected
-/// (e.g. the node is not, or is no longer, the leader).
+/// `ack` receives the bytes produced by `apply_log` once the command has been
+/// committed by a majority and applied to the state machine, or carries an
+/// error if the proposal is rejected (e.g. the node is not, or is no longer,
+/// the leader).
 #[derive(Debug)]
 pub struct Proposal {
     pub command: Bytes,
-    pub ack: oneshot::Sender<anyhow::Result<()>>,
+    pub ack: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
 /// User-facing handle to a running Raft node. Cloning shares the same node.
@@ -167,25 +169,29 @@ impl Server {
         }
     }
 
-    /// Submits `command` to the Raft protocol and resolves once it has been
+    /// Submits `command` to the Raft protocol and resolves with the bytes
+    /// produced by the state machine's `apply_log` once the command has been
     /// committed by a majority and applied to the state machine.
     ///
-    /// Errors if the node is shutting down, or if it loses / does not hold
+    /// Errors if the node is shutting down, if it loses / does not hold
     /// leadership before the command commits (callers should route the
-    /// command to the current leader or retry).
-    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<()> {
+    /// command to the current leader or retry), or if applying the command
+    /// to the state machine fails.
+    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<Bytes> {
         enqueue_proposal(&self.proposals, command.into()).await
     }
 }
 
 impl RaftNode {
-    /// Submits `command` to the Raft protocol and resolves once it has been
+    /// Submits `command` to the Raft protocol and resolves with the bytes
+    /// produced by the state machine's `apply_log` once the command has been
     /// committed by a majority and applied to the state machine.
     ///
-    /// Errors if the node is shutting down, or if it loses / does not hold
+    /// Errors if the node is shutting down, if it loses / does not hold
     /// leadership before the command commits (callers should route the
-    /// command to the current leader or retry).
-    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<()> {
+    /// command to the current leader or retry), or if applying the command
+    /// to the state machine fails.
+    pub async fn propose(&self, command: impl Into<Bytes>) -> anyhow::Result<Bytes> {
         enqueue_proposal(&self.proposals, command.into()).await
     }
 
@@ -202,7 +208,7 @@ impl RaftNode {
 async fn enqueue_proposal(
     proposals: &mpsc::Sender<Proposal>,
     command: Bytes,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Bytes> {
     let (ack_tx, ack_rx) = oneshot::channel();
     proposals
         .send(Proposal {
@@ -823,13 +829,27 @@ impl Server {
                 last_applied = next,
                 "applying committed log to state machine"
             );
-            self.state.state_machine.apply_log(&log.command)?;
-            self.state.last_applied = next;
+            match self.state.state_machine.apply_log(&log.command) {
+                Ok(applied) => {
+                    self.state.last_applied = next;
 
-            // The entry is now durable and applied: release any `propose()`
-            // caller waiting on this index.
-            if let Some(ack) = self.commit_notifiers.remove(&next) {
-                let _ = ack.send(Ok(()));
+                    // The entry is now durable and applied: hand the
+                    // state machine's output to any `propose()` caller
+                    // waiting on this index.
+                    if let Some(ack) = self.commit_notifiers.remove(&next) {
+                        let _ = ack.send(Ok(applied));
+                    }
+                }
+                Err(err) => {
+                    // Surface the failure to the originating `propose()`
+                    // caller instead of leaving it waiting forever.
+                    // `last_applied` stays put, so the entry is retried
+                    // on the next apply pass.
+                    if let Some(ack) = self.commit_notifiers.remove(&next) {
+                        let _ = ack.send(Err(err));
+                    }
+                    break;
+                }
             }
         }
 
@@ -844,7 +864,7 @@ impl Server {
     async fn append_proposed_command_to_log(
         &mut self,
         command: Bytes,
-        ack: oneshot::Sender<anyhow::Result<()>>,
+        ack: oneshot::Sender<anyhow::Result<Bytes>>,
     ) -> anyhow::Result<()> {
         let RaftState::Leader {
             match_index: _,
@@ -1572,8 +1592,10 @@ mod tests {
 
         server.leader().await;
         assert_eq!(server.state.commit_index, 0);
-        // The proposal must have been acked once committed and applied.
-        let _ = ack_rx.try_recv().unwrap().unwrap();
+        // The proposal must have been acked with the state machine's output
+        // once committed and applied.
+        let applied = ack_rx.try_recv().unwrap().unwrap();
+        assert_eq!(applied, Bytes::from("test-bytes"));
     }
 
     #[tokio::test]
@@ -1630,8 +1652,10 @@ mod tests {
         server.leader().await;
 
         assert_eq!(server.state.commit_index, 0);
-        // The proposal must have been acked once committed and applied.
-        let _ = ack_rx.try_recv().unwrap().unwrap();
+        // The proposal must have been acked with the state machine's output
+        // once committed and applied.
+        let applied = ack_rx.try_recv().unwrap().unwrap();
+        assert_eq!(applied, Bytes::from("cmd1"));
 
         warn!("changing node state back to leader, for running further test");
         server.state.state = RaftState::Leader {
@@ -1700,7 +1724,8 @@ mod tests {
 
         server.leader().await;
         assert_eq!(server.state.commit_index, 1);
-        let _ = ack_rx2.try_recv().unwrap().unwrap();
+        let applied2 = ack_rx2.try_recv().unwrap().unwrap();
+        assert_eq!(applied2, Bytes::from("cmd2"));
     }
 
     #[tokio::test]

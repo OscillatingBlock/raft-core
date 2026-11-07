@@ -40,7 +40,8 @@ impl StateMachine for TestStateMachine {
                 .unwrap()
                 .insert(k.to_string(), v.to_string());
         }
-        Ok(Bytes::new())
+        // Echo the applied command so callers can assert what came back.
+        Ok(command.clone())
     }
 }
 
@@ -220,11 +221,13 @@ async fn leader_propose_commits_and_replicates_to_all_nodes() {
         );
     }
 
-    leader_handle
+    let applied = leader_handle
         .node
         .propose(Bytes::from("foo=bar"))
         .await
         .expect("leader should accept and commit the proposed command");
+    // propose must return the bytes produced by the state machine's apply_log
+    assert_eq!(applied, Bytes::from("foo=bar"));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {

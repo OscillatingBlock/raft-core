@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         let command = Bytes::from(format!("demo-{n}"));
         println!("[demo] proposing: {command:?}");
         match raft_node.propose(command.clone()).await {
-            Ok(()) => info!(target: "main", command = ?command, "proposed command committed and applied"),
+            Ok(applied) => info!(target: "main", command = ?command, applied = ?applied, "proposed command committed and applied"),
             Err(e) => error!(target: "main", error = %e, "propose rejected (not the leader), will retry"),
         }
         n += 1;
